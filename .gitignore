@@ -1,0 +1,27 @@
+# Python cache and compiled files
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# OS files
+.DS_Store
+
+# Audio/output files
+output.wav
+
+# Local config and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.bak
+
+# Editor/IDE files
+.vscode/
+.idea/
+
+# Misc
+running.txt
