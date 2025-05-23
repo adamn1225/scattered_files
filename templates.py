@@ -13,9 +13,11 @@ COMMAND_TEMPLATES = {
     "delete duplicate files": "rm ~/Downloads/*\\(1\\)* ~/Downloads/*\\(2\\)*"
 }
 
-def match_template(user_input: str) -> str | None:
-    user_input = user_input.lower()
-    for key in COMMAND_TEMPLATES:
-        if key in user_input:
-            return COMMAND_TEMPLATES[key]
+def match_template(user_input):
+    for key, template in COMMAND_TEMPLATES.items():
+        if user_input.lower().startswith(key):
+            # Extract the task part
+            task = user_input[len(key):].strip()
+            # Optionally, handle time parsing here (e.g., "in one hour")
+            return template.replace("{task}", task)
     return None

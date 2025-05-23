@@ -6,13 +6,12 @@ from datetime import datetime, timedelta
 from collections import Counter
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
-    QLineEdit, QTextEdit, QComboBox, QMessageBox, QFileDialog, QDialog, QTableWidget, QTableWidgetItem, QTabWidget, QHBoxLayout
+    QLineEdit, QTextEdit, QComboBox, QMessageBox, QFileDialog, QDialog, QTableWidget, QTableWidgetItem, QTabWidget, QHBoxLayout, QInputDialog
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
 from PyQt6.QtGui import QPalette, QColor, QPixmap, QIcon
 from agents import Agent, Runner
 from tools.local_computer_tool import LocalComputerTool
-from templates import match_template
 from hot_commands import HOT_COMMANDS
 import subprocess
 from keyboard_logger import start_logger, stop_logger, is_logger_running
@@ -21,10 +20,15 @@ from memory import init_memory_db, save_command, retrieve_similar
 from pattern_learner import analyze_patterns
 from task_logger import log_task
 import threading
+import sounddevice as sd
+import numpy as np
+import scipy.io.wavfile
 import speech_recognition as sr
-from agent_core import agent, check_hot_command, match_template, analyze_speech_log, recognize_speech, transcribe_audio, log_transcribed_speech, process_user_command
-from templates import COMMAND_TEMPLATES
+from agent_core import agent, check_hot_command, analyze_speech_log, recognize_speech, transcribe_audio, log_transcribed_speech, process_user_command, maybe_execute_shell_command, schedule_reminder, open_file_with_default_app, summarize_recent_speech, schedule_reminder
+from templates import COMMAND_TEMPLATES, match_template
 from calendar_integration import get_upcoming_events
+from call_listener import CallSessionLogger
+import threading
 from dotenv import load_dotenv
 load_dotenv()
 api_key = os.environ["OPENAI_API_KEY"]
@@ -85,10 +89,26 @@ class ScreenshotViewer(QDialog):
         self.load_button.clicked.connect(self.load_next_image)
         self.layout.addWidget(self.load_button)
 
+        self.prev_button = QPushButton("Previous Screenshot")
+        self.prev_button.clicked.connect(self.load_prev_image)
+        self.layout.addWidget(self.prev_button)
+
+# Add this method:
+    def load_prev_image(self):
+        if not self.image_files:
+            self.image_label.setText("No screenshots found.")
+            return
+        if self.current_index <= 1:
+            self.image_label.setText("Start of screenshots.")
+            return
+        self.current_index -= 2  # Go back two, since load_next_image will increment by one
+        self.load_next_image()
 
         self.setLayout(self.layout)
 
         self.screenshot_dir = os.path.expanduser("~/.workspace_screens")
+        if not os.path.exists(self.screenshot_dir):
+            os.makedirs(self.screenshot_dir)
         self.image_files = sorted([
             f for f in os.listdir(self.screenshot_dir)
             if f.endswith(".png")
@@ -97,6 +117,8 @@ class ScreenshotViewer(QDialog):
 
         if self.image_files:
             self.load_next_image()
+        else:
+            self.image_label.setText("No screenshots found.")
 
     def load_next_image(self):
         if not self.image_files:
@@ -107,6 +129,9 @@ class ScreenshotViewer(QDialog):
             return
 
         path = os.path.join(self.screenshot_dir, self.image_files[self.current_index])
+        if not os.path.exists(path):
+            self.image_label.setText("Image file not found.")
+            return
         pixmap = QPixmap(path).scaled(760, 540, Qt.AspectRatioMode.KeepAspectRatio)
         self.image_label.setPixmap(pixmap)
         self.current_index += 1
@@ -125,12 +150,18 @@ class PhraseSummaryViewer(QDialog):
         self.generate_summary()
 
     def generate_summary(self):
-        conn = sqlite3.connect(KEYLOG_DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT key FROM keystrokes WHERE is_modifier = 0 ORDER BY id DESC LIMIT 500")
-        keys = [row[0] for row in c.fetchall()]
-        conn.close()
+        try:
+            conn = sqlite3.connect(KEYLOG_DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT key FROM keystrokes WHERE is_modifier = 0 ORDER BY id DESC LIMIT 500")
+            keys = [row[0] for row in c.fetchall()]
+            conn.close()
+        except Exception as e:
+            self.output.append(f"❌ Could not load keystrokes: {e}")
+            return
 
+        # Filter out None values
+        keys = [k for k in keys if k is not None]
         text = "".join(k for k in keys if len(k) == 1 or k.startswith("'") or k.isalnum())
         words = text.split()
         phrases = [" ".join(words[i:i+3]) for i in range(len(words)-2)]
@@ -150,6 +181,11 @@ class AgentRunnerApp(QWidget):
         self.last_agent_message = ""
         self.check_reminders()
         self.output_signal.connect(self.output_box.append)
+        self.last_command = ""
+        self.last_output = ""
+        self.call_logger = CallSessionLogger()
+        self.listening = False
+        self.listen_thread = None
 
     def init_ui(self):
         self.setWindowTitle("Scattered Files")
@@ -193,7 +229,9 @@ class AgentRunnerApp(QWidget):
         self.mic_button.setToolTip("Speak command")
         self.mic_button.setFixedSize(40, 40)
         self.mic_button.setStyleSheet("padding: 0px; margin: 0px; border: none;")
-        self.mic_button.clicked.connect(self.listen_to_mic)
+        self.mic_button.pressed.connect(self.start_command_recording)
+        self.mic_button.released.connect(self.stop_command_recording)
+        self.mic_button.setToolTip("Record and run a spoken command")
 
         input_row.addWidget(self.command_input)
         input_row.addWidget(self.mic_button)
@@ -225,10 +263,27 @@ class AgentRunnerApp(QWidget):
         agent_layout.addWidget(QLabel("Agent Output:"))
         agent_layout.addWidget(self.output_box)
 
+        feedback_row = QHBoxLayout()
+
+        self.thumbs_up_button = QPushButton("👍")
+        self.thumbs_down_button = QPushButton("👎")
+        self.learn_checkbox = QPushButton("💡 Learn this")
+        self.learn_checkbox.setCheckable(True)
+
+        self.thumbs_up_button.clicked.connect(lambda: self.save_feedback("up"))
+        self.thumbs_down_button.clicked.connect(lambda: self.save_feedback("down"))
+
+        feedback_row.addWidget(self.thumbs_up_button)
+        feedback_row.addWidget(self.thumbs_down_button)
+        feedback_row.addWidget(self.learn_checkbox)
+
+        agent_layout.addLayout(feedback_row)
+
         self.awaiting_reply = False
         self.last_agent_message = ""
 
         self.save_button = QPushButton("Save Output to File")
+        self.save_button.setToolTip("Save the agent output to a file")
         self.save_button.clicked.connect(self.save_output)
         agent_layout.addWidget(self.save_button)
         # --- Settings Buttons Group ---
@@ -239,18 +294,25 @@ class AgentRunnerApp(QWidget):
 
         self.toggle_logger_button = QPushButton()
         self.toggle_logger_button.clicked.connect(self.toggle_logger)
+        self.toggle_logger_button.setToolTip("Start or stop the keyboard logger")
         settings_layout.addWidget(self.toggle_logger_button)
         self.update_logger_button()
 
         self.calendar_button = QPushButton("📅 Show Next Calendar Event")
         self.calendar_button.clicked.connect(self.show_next_calendar_event)
+        self.calendar_button.setToolTip("Show your next calendar event")
         settings_layout.addWidget(self.calendar_button)
 
-        self.listen_button = QPushButton("🎤 Start Listening")
-        self.listen_button.setCheckable(True)
-        self.listen_button.setIcon(QIcon("mic.png"))
-        self.listen_button.clicked.connect(self.toggle_listen)
+        self.log_listen_button = QPushButton("📝 Log Speech")
+        self.log_listen_button.setCheckable(True)
+        self.log_listen_button.clicked.connect(self.toggle_log_listen)
+        self.log_listen_button.setToolTip("Transcribe and log speech (does not execute)")
+        settings_layout.addWidget(self.log_listen_button)
+        
+        self.listen_button = QPushButton("🎧 Toggle Listen Mode")
+        self.listen_button.clicked.connect(self.toggle_listen_mode)
         settings_layout.addWidget(self.listen_button)
+
 
         settings_group.setLayout(settings_layout)
         agent_layout.addWidget(settings_group)
@@ -310,6 +372,50 @@ class AgentRunnerApp(QWidget):
         main_layout.addWidget(tabs)
         self.setLayout(main_layout)
 
+    def start_command_recording(self):
+        self.recording = True
+        self.mic_button.setIcon(QIcon("mic-on.png"))  # Use a red or "on" icon
+        self.output_box.append("🎤 Hold to speak your command...")
+        self.command_audio = []
+        self.record_thread = threading.Thread(target=self._record_command_audio, daemon=True)
+        self.record_thread.start()
+
+    def stop_command_recording(self):
+        self.recording = False
+        self.mic_button.setIcon(QIcon("mic.png"))  # Revert to normal icon
+        self.output_box.append("🛑 Processing command...")
+        if hasattr(self, 'record_thread'):
+            self.record_thread.join()
+        self._process_command_audio()
+        self.mic_button.clearFocus()
+
+    def _record_command_audio(self):
+        import sounddevice as sd
+        import numpy as np
+        fs = 16000
+        self.command_audio = []
+        with sd.InputStream(samplerate=fs, channels=1, dtype='float32') as stream:
+            while self.recording:
+                chunk, _ = stream.read(int(fs * 0.1))
+                self.command_audio.append(chunk)
+        self.command_audio = np.vstack(self.command_audio) if self.command_audio else np.empty((0, 1), dtype=np.float32)
+
+    def _process_command_audio(self):
+        import scipy.io.wavfile
+        fs = 16000
+        if self.command_audio is not None and len(self.command_audio) > 0:
+            scipy.io.wavfile.write("output.wav", fs, (self.command_audio * 32767).astype(np.int16))
+            try:
+                text = transcribe_audio("output.wav")
+                self.output_box.append(f"🗣️ Whisper: {text}")
+                log_transcribed_speech(text)
+                if text.strip():
+                    asyncio.run(self.run_agent_command(text.strip()))
+            except Exception as e:
+                self.output_box.append(f"❌ Transcription error: {e}")
+        else:
+            self.output_box.append("No audio recorded.")
+
     def show_next_calendar_event(self):
         events = get_upcoming_events(1)
         if events:
@@ -323,7 +429,7 @@ class AgentRunnerApp(QWidget):
         patterns = analyze_patterns()
         dlg = QDialog(self)
         dlg.setWindowTitle("Routine Patterns")
-        dlg.resize(2000, 1500)
+        dlg.resize(1000, 750)
         layout = QVBoxLayout()
         output = QTextEdit()
         output.setReadOnly(True)
@@ -335,6 +441,38 @@ class AgentRunnerApp(QWidget):
         dlg.setLayout(layout)
         dlg.exec()
 
+    def toggle_listen_mode(self):
+        if not self.listening:
+            self.listen_thread = threading.Thread(target=self.listen_loop, daemon=True)
+            self.listening = True
+            self.call_logger.toggle_recording(True)
+            self.listen_thread.start()
+            self.show_notification("Listening started", "Call transcription has begun.")
+        else:
+            self.listening = False
+            self.call_logger.toggle_recording(False)
+            self.show_notification("Listening stopped", "Call transcription ended and summary saved.")
+
+    def listen_loop(self):
+        import speech_recognition as sr
+        recognizer = sr.Recognizer()
+        mic = sr.Microphone()
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source)
+            while self.listening:
+                try:
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+                    text = recognizer.recognize_google(audio)
+                    if text:
+                        self.call_logger.record_snippet(text)
+                except sr.WaitTimeoutError:
+                    continue
+                except sr.UnknownValueError:
+                    continue
+                except Exception as e:
+                    print(f"[listen_loop error] {e}")
+                    break
+                
     def toggle_logger(self):
         if is_logger_running():
             stop_logger()
@@ -349,91 +487,68 @@ class AgentRunnerApp(QWidget):
             self.toggle_logger_button.setText("🎹 Start Keyboard Logger")
             
 
-    def toggle_listen(self):
-        if self.listen_button.isChecked():
-            self.listen_button.setText("🛑 Listening...")
-            self.listen_button.setStyleSheet("background-color: #3b82f6; color: white; border: none;")
-            self.listen_button.setIcon(QIcon("mic-on.png"))
-            self.listening = True
-            self.listen_thread = threading.Thread(target=self.listen_to_mic, daemon=True)
-            self.listen_thread.start()
+    def toggle_log_listen(self):
+        if self.log_listen_button.isChecked():
+            self.log_listen_button.setText("🛑 Logging...")
+            self.log_listen_button.setIcon(QIcon("mic-on.png"))
+            self.log_listening = True  # <-- use log_listening
+            self.log_listen_thread = threading.Thread(target=self.listen_to_log, daemon=True)
+            self.log_listen_thread.start()
         else:
-            self.listen_button.setText("🎤 Start Listening")
-            self.listen_button.setStyleSheet("background-color: #334155; color: white; border: none;")
-            self.listen_button.setIcon(QIcon("mic.png"))
-            self.listening = False
+            self.log_listen_button.setText("📝 Log Speech")
+            self.log_listen_button.setIcon(QIcon("mic.png"))
+            self.log_listening = False  # <-- use log_listening
 
-    def listen_to_mic(self):
-        import sounddevice as sd
-        import numpy as np
-        import scipy.io.wavfile
-
+    # Passive log mic (in controls)
+    def listen_to_log(self):
         fs = 16000
         seconds = 5
 
-        self.output_signal.emit("🎤 Recording...")
+        self.output_box.append("🎤 Recording for log...")
         recording = np.empty((0, 1), dtype=np.float32)
         chunk_size = int(fs * 0.1)
         total_samples = int(fs * seconds)
         samples_recorded = 0
 
         with sd.InputStream(samplerate=fs, channels=1, dtype='float32') as stream:
-            while samples_recorded < total_samples and self.listening:
+            while samples_recorded < total_samples and self.log_listening:
                 chunk, _ = stream.read(chunk_size)
                 recording = np.vstack((recording, chunk))
                 samples_recorded += chunk.shape[0]
 
-        if not self.listening:
-            self.output_signal.emit("🛑 Recording stopped.")
+        if not self.log_listening:
+            self.output_box.append("🛑 Recording stopped.")
             return
 
         scipy.io.wavfile.write("output.wav", fs, (recording * 32767).astype(np.int16))
 
         try:
             text = transcribe_audio("output.wav")
-            self.output_signal.emit(f"🗣️ Whisper: {text}")
+            self.output_box.append(f"📝 Log: {text}")
             log_transcribed_speech(text)
-            if text.strip():
-                # Use QMetaObject.invokeMethod or a signal if you want to call run_agent_command
-                asyncio.run(self.run_agent_command(text.strip()))
         except Exception as e:
-            self.output_signal.emit(f"❌ Transcription error: {e}")
+            self.output_box.append(f"❌ Transcription error: {e}")
 
-   
+        summary = summarize_recent_speech()
+        if summary and len(summary) > 5:
+            self.output_box.append(f"📌 Call Summary Suggestion: {summary}")
+            confirm = QMessageBox.question(
+                self, "Set Reminder?",
+                f"Set a reminder based on this call?\n\n{summary}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                result = schedule_reminder(summary, 30)
+                self.output_box.append(result)
 
     def callback(self, text):
         if text:
             self.output_box.append(f"🗣️ {text}")
             log_transcribed_speech(text)
-
-    # In listen_to_mic after successful transcription:
         try:
             text = transcribe_audio("output.wav")
             self.output_box.append(f"🗣️ Whisper: {text}")
             self.log_transcribed_speech(text)
-        except Exception as e:
-            self.output_box.append(f"❌ Transcription error: {e}")
-
-    def listen_to_mic(self):
-        import sounddevice as sd
-        import scipy.io.wavfile
-
-        fs = 16000  # Sample rate
-        seconds = 5  # Duration of recording
-
-        self.output_box.append("🎤 Recording...")
-        recording = sd.rec(int(seconds * fs), samplerate=fs, channels=1)
-        sd.wait()  # Wait until recording is finished
-        scipy.io.wavfile.write("output.wav", fs, recording)
-
-        # Now transcribe
-        try:
-            text = transcribe_audio("output.wav")
-            self.output_box.append(f"🗣️ Whisper: {text}")
-            log_transcribed_speech(text)
-            # Send the transcribed text as a command to the agent
-            if text.strip():
-                asyncio.run(self.run_agent_command(text.strip()))
         except Exception as e:
             self.output_box.append(f"❌ Transcription error: {e}")
 
@@ -451,9 +566,6 @@ class AgentRunnerApp(QWidget):
     top_phrases = analyze_speech_log()
     for phrase, count in top_phrases:
         print(f"{phrase} — {count}x")
-
-    def show_notification(self, title, message):
-        subprocess.Popen(['notify-send', title, message])
 
     def show_screenshots(self):
         dlg = ScreenshotViewer()
@@ -489,6 +601,15 @@ class AgentRunnerApp(QWidget):
 
         asyncio.run(self.run_agent_command(command))
 
+    def some_method(self):
+        # Schedule a reminder for 30 minutes from now
+        result = schedule_reminder("Check the oven", 30)
+        self.output_box.append(result)
+
+        # Open a PDF file
+        result = open_file_with_default_app("/home/adam-noah/Documents/file.pdf")
+        self.output_box.append(result)
+
     async def run_agent_command(self, user_input):
         def gui_confirm():
             reply = QMessageBox.question(
@@ -499,6 +620,7 @@ class AgentRunnerApp(QWidget):
             return "y" if reply == QMessageBox.Yes else "n"
 
         output, cancelled = await process_user_command(user_input, confirm_delete_callback=gui_confirm)
+
         if cancelled:
             self.output_box.append("❌ Command cancelled by user.")
             self.awaiting_reply = False
@@ -506,7 +628,18 @@ class AgentRunnerApp(QWidget):
             self.command_input.setPlaceholderText("What should the agent do?")
             return
 
-        self.output_box.append(output)
+        # ✅ Save command and output for learning/memory
+        save_command(user_input, output)
+        self.last_command = user_input
+        self.last_output = output
+        self.learn_checkbox.setChecked(False)
+
+        # Show output
+        if "❌" in output or "error" in output.lower():
+            self.output_box.append(f"<span style='color:red;'>{output}</span>")
+        else:
+            self.output_box.append(output)
+
         if output.strip().endswith("?"):
             self.awaiting_reply = True
             self.last_agent_message = output
@@ -516,6 +649,20 @@ class AgentRunnerApp(QWidget):
             self.last_agent_message = ""
             self.command_input.setPlaceholderText("What should the agent do?")
 
+
+    async def execute_agent(self, command):
+        self.output_box.clear()
+
+        def confirm_gui_delete():
+            confirm = QMessageBox.question(self, "Confirm Deletion",
+                                        "This command may delete files. Are you sure?",
+                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            return "y" if confirm == QMessageBox.StandardButton.Yes else "n"
+
+        output_text, was_cancelled = await process_user_command(command, confirm_delete_callback=confirm_gui_delete)
+
+        if not was_cancelled:
+            self.output_box.append(output_text)
 
     def show_nudge(self):
         from pattern_learner import analyze_patterns
@@ -584,6 +731,10 @@ class AgentRunnerApp(QWidget):
 
 
         self.show_notification("Agent completed", "Task finished successfully!")
+
+    def get_user_feedback(self):
+        text, ok = QInputDialog.getText(self, "Feedback", "Was this helpful?")
+        return text if ok else ""
 
     def show_task_stats(self):
         import sqlite3
@@ -690,28 +841,47 @@ class AgentRunnerApp(QWidget):
 
 
 def init_db():
-    if not os.path.exists(DB_FILE):
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS task_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                task TEXT,
-                tags TEXT,
-                success INTEGER
-            )
-        """)
-        # Add this table for speech logs:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS speech_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                text TEXT
-            )
-        """)
-        conn.commit()
-        conn.close()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS task_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            task TEXT,
+            tags TEXT,
+            success INTEGER
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS speech_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            text TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS command_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            command TEXT,
+            output TEXT,
+            rating TEXT,
+            learn INTEGER
+        )
+    """)
+    # ADD THIS:
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS command_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            command TEXT,
+            output TEXT,
+            feedback TEXT,
+            embedding BLOB
+        )
+    """)
+    conn.commit()
+    conn.close()
     init_memory_db()
 
 def main():

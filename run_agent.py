@@ -6,15 +6,37 @@ from tools.local_computer_tool import LocalComputerTool
 from templates import match_template
 from hot_commands import HOT_COMMANDS
 import subprocess
-from agent_core import agent, check_hot_command, match_template
+from agent_core import agent, check_hot_command, match_template, maybe_execute_shell_command
 import whisper
 import sounddevice as sd
 import scipy.io.wavfile
 from dotenv import load_dotenv
 from agent_core import process_user_command
+import json
+from file_index import init_file_index_db
 
 load_dotenv()
 api_key = os.environ["OPENAI_API_KEY"]
+
+def load_system_info():
+    try:
+        with open("system_info.json") as f:
+            return json.load(f)
+    except Exception:
+        # Fallback: gather some info dynamically
+        import platform, getpass, socket
+        return {
+            "os": platform.system(),
+            "distro": " ".join(platform.linux_distribution()) if hasattr(platform, "linux_distribution") else "",
+            "hostname": socket.gethostname(),
+            "user": getpass.getuser(),
+            "shell": os.environ.get("SHELL", ""),
+            "home": os.path.expanduser("~"),
+            "has_sudo": os.geteuid() == 0,
+            "default_terminal": "gnome-terminal"
+        }
+
+SYSTEM_INFO = load_system_info()
 
 HELP_TEXT = """
 Usage: run_agent.py [task]
@@ -74,6 +96,7 @@ def record_and_transcribe():
 
 
 async def main():
+    init_file_index_db()
     if len(sys.argv) == 2 and sys.argv[1] == "-h":
         print(HELP_TEXT)
         return
@@ -117,4 +140,6 @@ async def main():
 
     print("\n=== Agent Output ===")
     print(result.final_output)
+    print(output)
+    maybe_execute_shell_command(output)
 

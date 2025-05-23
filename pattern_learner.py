@@ -16,8 +16,13 @@ def group_by_day(entries):
     return patterns
 
 def analyze_patterns():
-    c.execute("SELECT timestamp, task FROM task_log WHERE success=1")
-    entries = c.fetchall()
+    c.execute("""
+        SELECT task_log.timestamp, task_log.task, command_memory.feedback
+        FROM task_log
+        LEFT JOIN command_memory ON task_log.task = command_memory.command
+        WHERE success=1
+    """)
+    entries = [(ts, task) for ts, task, fb in c.fetchall() if not fb or "no" not in fb.lower()]
     return group_by_day(entries)
 
 if __name__ == "__main__":

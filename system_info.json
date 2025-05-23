@@ -1,0 +1,10 @@
+{
+    "os": "Linux",
+    "distro": "Ubuntu 22.04",
+    "hostname": "adam-noah-pc",
+    "user": "adam-noah",
+    "shell": "/bin/bash",
+    "home": "/home/adam-noah",
+    "has_sudo": true,
+    "default_terminal": "gnome-terminal"
+  }
