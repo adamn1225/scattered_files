@@ -6,10 +6,10 @@ from datetime import datetime, timedelta
 from collections import Counter
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
-    QLineEdit, QTextEdit, QComboBox, QMessageBox, QFileDialog, QDialog, QTableWidget, QTableWidgetItem
+    QLineEdit, QTextEdit, QComboBox, QMessageBox, QFileDialog, QDialog, QTableWidget, QTableWidgetItem, QTabWidget, QHBoxLayout
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QPalette, QColor, QPixmap
+from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
+from PyQt6.QtGui import QPalette, QColor, QPixmap, QIcon
 from agents import Agent, Runner
 from tools.local_computer_tool import LocalComputerTool
 from templates import match_template
@@ -22,8 +22,12 @@ from pattern_learner import analyze_patterns
 from task_logger import log_task
 import threading
 import speech_recognition as sr
-from agent_core import agent, check_hot_command, match_template, recognize_speech, transcribe_audio
+from agent_core import agent, check_hot_command, match_template, analyze_speech_log, recognize_speech, transcribe_audio, log_transcribed_speech, process_user_command
 from templates import COMMAND_TEMPLATES
+from calendar_integration import get_upcoming_events
+from dotenv import load_dotenv
+load_dotenv()
+api_key = os.environ["OPENAI_API_KEY"]
 
 DB_FILE = os.path.expanduser("~/.workspace_agent.db")
 KEYLOG_DB_FILE = os.path.expanduser("~/.workspace_agent_typing.db")
@@ -37,7 +41,6 @@ agent = Agent(
     ),
     tools=[LocalComputerTool],
 )
-
 
 
 class KeystrokeLogViewer(QDialog):
@@ -138,15 +141,20 @@ class PhraseSummaryViewer(QDialog):
             self.output.append(f"{phrase} — {count}x")
 
 class AgentRunnerApp(QWidget):
+    output_signal = pyqtSignal(str)
     def __init__(self):
         super().__init__()
         self.logger_running = is_logger_running()
-        self.init_ui()
+        self.init_ui() 
+        self.awaiting_reply = False
+        self.last_agent_message = ""
         self.check_reminders()
+        self.output_signal.connect(self.output_box.append)
 
     def init_ui(self):
         self.setWindowTitle("Scattered Files")
-        self.setGeometry(300, 300, 600, 600)
+        self.setWindowIcon(QIcon("icon.png"))
+        self.setGeometry(400, 400, 800, 800)
         self.timer = QTimer(self)
         self.timer.timeout.connect(capture_and_store_all_screens)
         self.timer.start(10 * 60 * 1000)
@@ -158,89 +166,164 @@ class AgentRunnerApp(QWidget):
         palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
         palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
         self.setPalette(palette)
-        self.setStyleSheet("QLabel { color: white; } QPushButton { background-color: #334155; color: white; border: none; padding: 6px; } QPushButton:hover { background-color: #3b82f6; }")
+        self.setStyleSheet("""
+        QWidget { background-color: #1e293b; color: white; }
+        QTabWidget::pane { background: #1e293b; }
+        QTabBar::tab { background: #334155; color: white; }
+        QTabBar::tab:selected { background: #3b82f6; }
+        QLabel { color: white; }
+        QPushButton { background-color: #334155; color: white; border: none; padding: 6px; }
+        QPushButton:hover { background-color: #3b82f6; }
+    """)
 
-        layout = QVBoxLayout()
+        tabs = QTabWidget()
 
+        # --- Agent Tab ---
+        agent_tab = QWidget()
+        agent_layout = QVBoxLayout()
+
+        input_row = QHBoxLayout()
         self.command_input = QLineEdit()
         self.command_input.setPlaceholderText("What should the agent do?")
         self.command_input.textChanged.connect(self.suggest_similar_commands)
-        layout.addWidget(QLabel("Enter Command:"))
-        layout.addWidget(self.command_input)
+
+        self.mic_button = QPushButton()
+        self.mic_button.setIcon(QIcon("mic.png"))
+        self.mic_button.setIconSize(QSize(28, 28))  # Adjust as needed
+        self.mic_button.setToolTip("Speak command")
+        self.mic_button.setFixedSize(40, 40)
+        self.mic_button.setStyleSheet("padding: 0px; margin: 0px; border: none;")
+        self.mic_button.clicked.connect(self.listen_to_mic)
+
+        input_row.addWidget(self.command_input)
+        input_row.addWidget(self.mic_button)
+
+        agent_layout.addWidget(QLabel("Enter Command:"))
+        agent_layout.addLayout(input_row)
 
         self.template_command_box = QComboBox()
         self.template_command_box.addItem("-- Choose template command --")
         for key in COMMAND_TEMPLATES:
             self.template_command_box.addItem(key)
         self.template_command_box.currentIndexChanged.connect(self.load_template_command)
-        layout.addWidget(self.template_command_box)
+        agent_layout.addWidget(self.template_command_box)
 
         self.hot_command_box = QComboBox()
         self.hot_command_box.addItem("-- Choose hot command --")
         for key in HOT_COMMANDS:
             self.hot_command_box.addItem(key)
         self.hot_command_box.currentIndexChanged.connect(self.load_hot_command)
-        layout.addWidget(self.hot_command_box)
+        agent_layout.addWidget(self.hot_command_box)
 
         self.run_button = QPushButton("Run Agent")
         self.run_button.clicked.connect(self.run_agent)
-        layout.addWidget(self.run_button)
+        agent_layout.addWidget(self.run_button)
 
         self.output_box = QTextEdit()
         self.output_box.setReadOnly(True)
         self.output_box.setStyleSheet("background-color: #121c2b; color: white;")
-        layout.addWidget(QLabel("Agent Output:"))
-        layout.addWidget(self.output_box)
+        agent_layout.addWidget(QLabel("Agent Output:"))
+        agent_layout.addWidget(self.output_box)
+
+        self.awaiting_reply = False
+        self.last_agent_message = ""
 
         self.save_button = QPushButton("Save Output to File")
         self.save_button.clicked.connect(self.save_output)
-        layout.addWidget(self.save_button)
+        agent_layout.addWidget(self.save_button)
+        # --- Settings Buttons Group ---
+        from PyQt6.QtWidgets import QGroupBox
+
+        settings_group = QGroupBox("Controls")
+        settings_layout = QVBoxLayout()
 
         self.toggle_logger_button = QPushButton()
         self.toggle_logger_button.clicked.connect(self.toggle_logger)
-        layout.addWidget(self.toggle_logger_button)
+        settings_layout.addWidget(self.toggle_logger_button)
         self.update_logger_button()
 
-        self.log_view_button = QPushButton("View Keystroke Log")
-        self.log_view_button.clicked.connect(self.show_keystroke_log)
-        layout.addWidget(self.log_view_button)
-
-        self.summary_button = QPushButton("🧠 Summarize Phrases")
-        self.summary_button.clicked.connect(self.show_phrase_summary)
-        layout.addWidget(self.summary_button)
-
-        self.view_screenshots_button = QPushButton("🖼️ View Screenshots")
-        self.view_screenshots_button.clicked.connect(self.show_screenshots)
-        layout.addWidget(self.view_screenshots_button)
-
-        self.pattern_button = QPushButton("📊 Show Routine Patterns")
-        self.pattern_button.clicked.connect(self.show_patterns)
-        layout.addWidget(self.pattern_button)
-
-        self.nudge_button = QPushButton("🤖 Nudge Me (Today's Routine)")
-        self.nudge_button.clicked.connect(self.show_nudge)
-        layout.addWidget(self.nudge_button)
-
-        self.log_task_button = QPushButton("📝 Log Task Manually")
-        self.log_task_button.clicked.connect(self.show_log_task)
-        layout.addWidget(self.log_task_button)
-
-        self.stats_button = QPushButton("📈 Show Task Stats")
-        self.stats_button.clicked.connect(self.show_task_stats)
-        layout.addWidget(self.stats_button)
+        self.calendar_button = QPushButton("📅 Show Next Calendar Event")
+        self.calendar_button.clicked.connect(self.show_next_calendar_event)
+        settings_layout.addWidget(self.calendar_button)
 
         self.listen_button = QPushButton("🎤 Start Listening")
         self.listen_button.setCheckable(True)
+        self.listen_button.setIcon(QIcon("mic.png"))
         self.listen_button.clicked.connect(self.toggle_listen)
-        layout.addWidget(self.listen_button)
+        settings_layout.addWidget(self.listen_button)
 
-        self.setLayout(layout)
+        settings_group.setLayout(settings_layout)
+        agent_layout.addWidget(settings_group)
+
+        agent_tab.setLayout(agent_layout)
+        tabs.addTab(agent_tab, "Agent")
+
+        # --- Logs Tab ---
+        logs_tab = QWidget()
+        logs_layout = QVBoxLayout()
+
+        self.log_view_button = QPushButton("View Keystroke Log")
+        self.log_view_button.clicked.connect(self.show_keystroke_log)
+        logs_layout.addWidget(self.log_view_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.summary_button = QPushButton("🧠 Summarize Phrases")
+        self.summary_button.clicked.connect(self.show_phrase_summary)
+        logs_layout.addWidget(self.summary_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.view_screenshots_button = QPushButton("🖼️ View Screenshots")
+        self.view_screenshots_button.clicked.connect(self.show_screenshots)
+        logs_layout.addWidget(self.view_screenshots_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        logs_layout.addStretch()  
+        logs_tab.setLayout(logs_layout)
+        tabs.addTab(logs_tab, "Logs")
+
+        # --- Stats Tab ---
+        stats_tab = QWidget()
+        stats_layout = QVBoxLayout()
+
+        self.pattern_button = QPushButton("📊 Show Routine Patterns")
+        self.pattern_button.clicked.connect(self.show_patterns)
+        stats_layout.addWidget(self.pattern_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.nudge_button = QPushButton("🤖 Nudge Me (Today's Routine)")
+        self.nudge_button.clicked.connect(self.show_nudge)
+        stats_layout.addWidget(self.nudge_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.log_task_button = QPushButton("📝 Log Task Manually")
+        self.log_task_button.clicked.connect(self.show_log_task)
+        stats_layout.addWidget(self.log_task_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.stats_button = QPushButton("📈 Show Task Stats")
+        self.stats_button.clicked.connect(self.show_task_stats)
+        stats_layout.addWidget(self.stats_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.check_reminders_button = QPushButton("🔔 Check Reminders")
+        self.check_reminders_button.clicked.connect(self.check_reminders)
+        stats_layout.addWidget(self.check_reminders_button, alignment=Qt.AlignmentFlag.AlignTop)
+        stats_layout.addStretch()
+        stats_tab.setLayout(stats_layout)
+        tabs.addTab(stats_tab, "Stats")
+
+        # --- Main Layout ---
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(tabs)
+        self.setLayout(main_layout)
+
+    def show_next_calendar_event(self):
+        events = get_upcoming_events(1)
+        if events:
+            next_event = events[0]
+            start = next_event['start'].get('dateTime', next_event['start'].get('date'))
+            self.output_box.append(f"📅 Next meeting: {next_event['summary']} at {start}")
+        else:
+            self.output_box.append("No upcoming meetings found.")
 
     def show_patterns(self):
         patterns = analyze_patterns()
         dlg = QDialog(self)
         dlg.setWindowTitle("Routine Patterns")
-        dlg.resize(600, 400)
+        dlg.resize(2000, 1500)
         layout = QVBoxLayout()
         output = QTextEdit()
         output.setReadOnly(True)
@@ -264,16 +347,72 @@ class AgentRunnerApp(QWidget):
             self.toggle_logger_button.setText("🛑 Stop Keyboard Logger")
         else:
             self.toggle_logger_button.setText("🎹 Start Keyboard Logger")
+            
 
     def toggle_listen(self):
         if self.listen_button.isChecked():
-            self.listen_button.setText("🛑 Stop Listening")
+            self.listen_button.setText("🛑 Listening...")
+            self.listen_button.setStyleSheet("background-color: #3b82f6; color: white; border: none;")
+            self.listen_button.setIcon(QIcon("mic-on.png"))
             self.listening = True
             self.listen_thread = threading.Thread(target=self.listen_to_mic, daemon=True)
             self.listen_thread.start()
         else:
             self.listen_button.setText("🎤 Start Listening")
+            self.listen_button.setStyleSheet("background-color: #334155; color: white; border: none;")
+            self.listen_button.setIcon(QIcon("mic.png"))
             self.listening = False
+
+    def listen_to_mic(self):
+        import sounddevice as sd
+        import numpy as np
+        import scipy.io.wavfile
+
+        fs = 16000
+        seconds = 5
+
+        self.output_signal.emit("🎤 Recording...")
+        recording = np.empty((0, 1), dtype=np.float32)
+        chunk_size = int(fs * 0.1)
+        total_samples = int(fs * seconds)
+        samples_recorded = 0
+
+        with sd.InputStream(samplerate=fs, channels=1, dtype='float32') as stream:
+            while samples_recorded < total_samples and self.listening:
+                chunk, _ = stream.read(chunk_size)
+                recording = np.vstack((recording, chunk))
+                samples_recorded += chunk.shape[0]
+
+        if not self.listening:
+            self.output_signal.emit("🛑 Recording stopped.")
+            return
+
+        scipy.io.wavfile.write("output.wav", fs, (recording * 32767).astype(np.int16))
+
+        try:
+            text = transcribe_audio("output.wav")
+            self.output_signal.emit(f"🗣️ Whisper: {text}")
+            log_transcribed_speech(text)
+            if text.strip():
+                # Use QMetaObject.invokeMethod or a signal if you want to call run_agent_command
+                asyncio.run(self.run_agent_command(text.strip()))
+        except Exception as e:
+            self.output_signal.emit(f"❌ Transcription error: {e}")
+
+   
+
+    def callback(self, text):
+        if text:
+            self.output_box.append(f"🗣️ {text}")
+            log_transcribed_speech(text)
+
+    # In listen_to_mic after successful transcription:
+        try:
+            text = transcribe_audio("output.wav")
+            self.output_box.append(f"🗣️ Whisper: {text}")
+            self.log_transcribed_speech(text)
+        except Exception as e:
+            self.output_box.append(f"❌ Transcription error: {e}")
 
     def listen_to_mic(self):
         import sounddevice as sd
@@ -291,6 +430,10 @@ class AgentRunnerApp(QWidget):
         try:
             text = transcribe_audio("output.wav")
             self.output_box.append(f"🗣️ Whisper: {text}")
+            log_transcribed_speech(text)
+            # Send the transcribed text as a command to the agent
+            if text.strip():
+                asyncio.run(self.run_agent_command(text.strip()))
         except Exception as e:
             self.output_box.append(f"❌ Transcription error: {e}")
 
@@ -304,6 +447,10 @@ class AgentRunnerApp(QWidget):
             with open(filepath, "w") as f:
                 f.write(text)
             QMessageBox.information(self, "Saved", f"Output saved to {filepath}")
+    # In start_continuous_recognition's callback:
+    top_phrases = analyze_speech_log()
+    for phrase, count in top_phrases:
+        print(f"{phrase} — {count}x")
 
     def show_notification(self, title, message):
         subprocess.Popen(['notify-send', title, message])
@@ -335,7 +482,40 @@ class AgentRunnerApp(QWidget):
         if not command:
             QMessageBox.warning(self, "Warning", "You must enter a command.")
             return
-        asyncio.run(self.execute_agent(command))
+
+        if self.awaiting_reply:
+            # Combine last agent message and user reply for context
+            command = f"{self.last_agent_message}\nUser: {command}"
+
+        asyncio.run(self.run_agent_command(command))
+
+    async def run_agent_command(self, user_input):
+        def gui_confirm():
+            reply = QMessageBox.question(
+                self, "Confirm Delete",
+                "⚠️ This will delete files. Are you sure?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            return "y" if reply == QMessageBox.Yes else "n"
+
+        output, cancelled = await process_user_command(user_input, confirm_delete_callback=gui_confirm)
+        if cancelled:
+            self.output_box.append("❌ Command cancelled by user.")
+            self.awaiting_reply = False
+            self.last_agent_message = ""
+            self.command_input.setPlaceholderText("What should the agent do?")
+            return
+
+        self.output_box.append(output)
+        if output.strip().endswith("?"):
+            self.awaiting_reply = True
+            self.last_agent_message = output
+            self.command_input.setPlaceholderText("Reply to agent...")
+        else:
+            self.awaiting_reply = False
+            self.last_agent_message = ""
+            self.command_input.setPlaceholderText("What should the agent do?")
+
 
     def show_nudge(self):
         from pattern_learner import analyze_patterns
@@ -401,44 +581,9 @@ class AgentRunnerApp(QWidget):
         log_btn.clicked.connect(do_log)
         dlg.exec()
 
-    async def execute_agent(self, command):
-            self.output_box.clear()
 
-            result = await Runner.run(agent, command)
-            self.output_box.append(f"=== Output ===\n{result.final_output}")
 
-            save_command(command) 
-
-            script, project_name = check_hot_command(command)
-            if script:
-                self.output_box.append(f"🚀 Running hot command: {script} with project '{project_name}'")
-                subprocess.run(["python", script, project_name])
-                return
-
-            template_command = match_template(command)
-            if template_command:
-                command = template_command
-
-            if "rm " in command or "delete" in command.lower():
-                confirm = QMessageBox.question(self, "Confirm Deletion",
-                                            "This command may delete files. Are you sure?",
-                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if confirm != QMessageBox.StandardButton.Yes:
-                    self.output_box.append("❌ Cancelled.")
-                    return
-
-            result = await Runner.run(agent, command)
-            self.output_box.append(f"=== Output ===\n{result.final_output}")
-
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            ts = datetime.now().isoformat()
-            c.execute("INSERT INTO task_log (timestamp, task, tags, success) VALUES (?, ?, ?, ?)",
-                    (ts, command, "gui", 1))
-            conn.commit()
-            conn.close()
-
-            self.show_notification("Agent completed", "Task finished successfully!")
+        self.show_notification("Agent completed", "Task finished successfully!")
 
     def show_task_stats(self):
         import sqlite3
@@ -489,17 +634,6 @@ class AgentRunnerApp(QWidget):
         dlg.setLayout(layout)
         dlg.exec()
 
-    def save_output(self):
-            text = self.output_box.toPlainText()
-            if not text.strip():
-                QMessageBox.information(self, "No Output", "There is no output to save.")
-                return
-            filepath, _ = QFileDialog.getSaveFileName(self, "Save Output", os.path.expanduser("~/agent_output.txt"), "Text Files (*.txt)")
-            if filepath:
-                with open(filepath, "w") as f:
-                    f.write(text)
-                QMessageBox.information(self, "Saved", f"Output saved to {filepath}")
-
     def show_notification(self, title, message):
             subprocess.Popen(['notify-send', title, message])
 
@@ -532,22 +666,6 @@ class AgentRunnerApp(QWidget):
                 self.toggle_logger_button.setText("🎹 Start Keyboard Logger")
 
 
-
-    def check_reminders(self):
-            if not os.path.exists(DB_FILE):
-                return
-            try:
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                one_hour_ago = datetime.now() - timedelta(hours=1)
-                c.execute("SELECT task FROM task_log WHERE timestamp >= ? ORDER BY timestamp DESC", (one_hour_ago.isoformat(),))
-                rows = c.fetchall()
-                if rows:
-                    self.show_notification("Reminder", f"You recently ran: {rows[0][0]}")
-                conn.close()
-            except Exception as e:
-                print("Reminder check failed:", e)
-
     def save_output(self):
             text = self.output_box.toPlainText()
             if not text.strip():
@@ -569,6 +687,8 @@ class AgentRunnerApp(QWidget):
             for cmd, score in suggestions:
                 self.output_box.append(f"  {cmd} ({score:.2f})")
 
+
+
 def init_db():
     if not os.path.exists(DB_FILE):
         conn = sqlite3.connect(DB_FILE)
@@ -580,6 +700,14 @@ def init_db():
                 task TEXT,
                 tags TEXT,
                 success INTEGER
+            )
+        """)
+        # Add this table for speech logs:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS speech_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                text TEXT
             )
         """)
         conn.commit()

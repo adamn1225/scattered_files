@@ -1,11 +1,20 @@
 import asyncio
 import sys
+import os
 from agents import Agent, Runner
 from tools.local_computer_tool import LocalComputerTool
 from templates import match_template
 from hot_commands import HOT_COMMANDS
 import subprocess
 from agent_core import agent, check_hot_command, match_template
+import whisper
+import sounddevice as sd
+import scipy.io.wavfile
+from dotenv import load_dotenv
+from agent_core import process_user_command
+
+load_dotenv()
+api_key = os.environ["OPENAI_API_KEY"]
 
 HELP_TEXT = """
 Usage: run_agent.py [task]
@@ -50,13 +59,36 @@ def check_hot_command(user_input: str):
             return val["script"], name
     return None, None
 
+def record_and_transcribe():
+    fs = 16000
+    seconds = 5
+    print("🎤 Speak now...")
+    recording = sd.rec(int(seconds * fs), samplerate=fs, channels=1)
+    sd.wait()
+    wav_path = "voice_input.wav"
+    scipy.io.wavfile.write(wav_path, fs, recording)
+    model = whisper.load_model("base")
+    result = model.transcribe(wav_path)
+    print(f"🗣️ You said: {result['text']}")
+    return result['text']
+
 
 async def main():
     if len(sys.argv) == 2 and sys.argv[1] == "-h":
         print(HELP_TEXT)
         return
+    
+    if "--mic" in sys.argv:
+        user_input = record_and_transcribe()
+    else:
+        user_input = " ".join(arg for arg in sys.argv[1:] if arg != "--mic") if len(sys.argv) > 1 else input("What should the agent do?\n> ")
 
-    user_input = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("What should the agent do?\n> ")
+    output, cancelled = await process_user_command(user_input)
+    if not cancelled:
+        from task_logger import log_task
+        log_task(user_input, tags=["agent"], success=True)
+    print("\n=== Agent Output ===")
+    print(output)
 
     # Check for hot command first
     script, project_name = check_hot_command(user_input)
